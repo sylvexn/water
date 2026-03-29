@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.db
+__pycache__/
+.env
+plan-project.md

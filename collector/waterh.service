@@ -1,0 +1,22 @@
+[Unit]
+Description=WaterH BLE Collector
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=syl
+ExecStart=/usr/bin/python3 /opt/waterh/collector.py
+WorkingDirectory=/opt/waterh
+Restart=always
+RestartSec=10
+WatchdogSec=120
+
+Environment=WATERH_ADDR=A4:C1:38:32:D7:DE
+Environment=WATERH_POLL_INTERVAL=30
+Environment=WATERH_DB_PATH=/opt/waterh/waterh.db
+Environment=WATERH_API_URL=https://water.syl.rest/api/ingest
+EnvironmentFile=-/opt/waterh/.env
+
+[Install]
+WantedBy=multi-user.target

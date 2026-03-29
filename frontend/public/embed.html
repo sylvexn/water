@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: transparent; font-family: "JetBrains Mono", "Fira Code", monospace; }
+  .widget {
+    background: #141414;
+    border: 1px solid #1e1e1e;
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    max-width: 280px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .widget:hover { border-color: #4fc3f7; }
+  .ring-container { position: relative; width: 56px; height: 56px; flex-shrink: 0; }
+  .ring-bg, .ring-fill { fill: none; stroke-width: 5; }
+  .ring-bg { stroke: #1e1e1e; }
+  .ring-fill { stroke: #4fc3f7; stroke-linecap: round; transition: stroke-dashoffset 0.8s ease; }
+  .ring-text {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: #4fc3f7; font-weight: 600;
+  }
+  .info { flex: 1; }
+  .info .ml { font-size: 1.1em; color: #d4d4d4; font-weight: 600; }
+  .info .ml span { font-size: 0.55em; color: #666; }
+  .info .meta { font-size: 0.65em; color: #666; margin-top: 3px; }
+  .info .meta .dot { color: #66bb6a; }
+  .info .meta .dot.off { color: #ef5350; }
+</style>
+</head>
+<body>
+<a class="widget" href="https://water.syl.rest" target="_blank" id="w">
+  <div class="ring-container">
+    <svg viewBox="0 0 36 36" width="56" height="56">
+      <circle class="ring-bg" cx="18" cy="18" r="15.9" />
+      <circle class="ring-fill" id="ring" cx="18" cy="18" r="15.9"
+        stroke-dasharray="100" stroke-dashoffset="100"
+        transform="rotate(-90 18 18)" />
+    </svg>
+    <div class="ring-text" id="pct">—</div>
+  </div>
+  <div class="info">
+    <div class="ml" id="ml">—<span>ml</span></div>
+    <div class="meta"><span class="dot" id="dot">●</span> <span id="meta">loading</span></div>
+  </div>
+</a>
+<script>
+(async () => {
+  try {
+    const [wr, sr] = await Promise.all([
+      fetch("https://water.syl.rest/api/widget"),
+      fetch("https://water.syl.rest/api/status"),
+    ]);
+    const w = await wr.json();
+    const s = await sr.json();
+    document.getElementById("ml").innerHTML = `${w.today_ml}<span>ml</span>`;
+    document.getElementById("pct").textContent = `${w.goal_pct}%`;
+    document.getElementById("ring").style.strokeDashoffset = 100 - w.goal_pct;
+    const dot = document.getElementById("dot");
+    dot.className = s.online ? "dot" : "dot off";
+    document.getElementById("meta").textContent = `${w.sip_count} sips today`;
+  } catch(e) {
+    document.getElementById("meta").textContent = "offline";
+  }
+})();
+</script>
+</body>
+</html>

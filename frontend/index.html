@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WaterH</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>WaterH</h1>
+      <span id="status" class="status"></span>
+    </header>
+
+    <nav>
+      <button class="nav-btn active" data-page="today">Today</button>
+      <button class="nav-btn" data-page="history">History</button>
+      <button class="nav-btn" data-page="about">About</button>
+    </nav>
+
+    <main>
+      <!-- Today -->
+      <section id="page-today" class="page active">
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-label">Intake</div>
+            <div class="stat-value"><span id="today-ml">0</span><span class="unit">ml</span></div>
+            <div class="progress"><div class="progress-fill" id="today-bar"></div></div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Sips</div>
+            <div class="stat-value" id="today-sips">0</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Temp</div>
+            <div class="stat-value"><span id="today-temp">—</span><span class="unit">°C</span></div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Goal</div>
+            <div class="stat-value"><span id="today-pct">0</span><span class="unit">%</span></div>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Time</th><th>Amount</th><th>Temp</th><th></th></tr></thead>
+          <tbody id="sip-table"></tbody>
+        </table>
+      </section>
+
+      <!-- History -->
+      <section id="page-history" class="page">
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-label">Avg Daily</div>
+            <div class="stat-value"><span id="hist-avg">0</span><span class="unit">ml</span></div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Best Day</div>
+            <div class="stat-value"><span id="hist-best">0</span><span class="unit">ml</span></div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Streak</div>
+            <div class="stat-value"><span id="hist-streak">0</span><span class="unit">days</span></div>
+          </div>
+        </div>
+        <div class="chart-container">
+          <canvas id="history-chart"></canvas>
+        </div>
+        <div id="heatmap" class="heatmap"></div>
+      </section>
+
+      <!-- About -->
+      <section id="page-about" class="page">
+        <div class="about-content">
+          <h2>How this works</h2>
+          <p>This dashboard displays live hydration data from a <strong>WaterH-Boost-24oz</strong> smart water bottle, reverse-engineered from its undocumented BLE protocol.</p>
+          <h3>The process</h3>
+          <ol>
+            <li><strong>Ruled out cloud interception</strong> — mitmproxy showed the app makes zero network calls. All data stays local over BLE.</li>
+            <li><strong>Discovered the bottle</strong> — BLE scan from a nearby Linux box found it advertising as <code>WaterH-Boost-24oz</code>.</li>
+            <li><strong>Mapped GATT services</strong> — standard Chinese BLE UART bridge. Notify on <code>0xFFE4</code>, write on <code>0xFFE9</code>.</li>
+            <li><strong>Fuzzed commands</strong> — sent every single-byte command 0x00–0x20, ASCII prefix pairs, and framed packets. Found that <code>0x04</code> triggers a full data dump.</li>
+            <li><strong>Decoded the protocol</strong> — response comes as RT (status) + RP (config) + PT (sip history). Each sip record is 13 bytes: timestamp + intake_ml + temperature.</li>
+          </ol>
+          <h3>Architecture</h3>
+          <pre>
+Bottle --BLE--> fridge (collector) --HTTPS--> VPS (API + dashboard)
+                  polling 30s               water.syl.rest</pre>
+          <p><a href="https://github.com/syl/waterh" target="_blank">GitHub →</a></p>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
