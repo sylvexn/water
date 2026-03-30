@@ -8,7 +8,9 @@ Deployed on Coolify at water.syl.rest.
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+TZ_OFFSET = int(os.environ.get("WATERH_TZ_OFFSET", "-5"))  # hours from UTC
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -104,7 +106,8 @@ def ingest(payload: IngestPayload, authorization: str = Header(None)):
 
 @app.get("/api/today")
 def today():
-    today_str = date.today().isoformat()
+    local_tz = timezone(timedelta(hours=TZ_OFFSET))
+    today_str = datetime.now(local_tz).date().isoformat()
     with get_db() as db:
         rows = db.execute(
             "SELECT timestamp, intake_ml, temp_c FROM sips WHERE DATE(timestamp) = ? ORDER BY timestamp",
@@ -129,7 +132,8 @@ def today():
 @app.get("/api/history")
 def history(days: int = 30):
     days = min(days, 365)
-    start = (date.today() - timedelta(days=days)).isoformat()
+    local_tz = timezone(timedelta(hours=TZ_OFFSET))
+    start = (datetime.now(local_tz).date() - timedelta(days=days)).isoformat()
     with get_db() as db:
         rows = db.execute(
             """

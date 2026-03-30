@@ -20,7 +20,7 @@ from bleak import BleakClient, BleakScanner
 BOTTLE_ADDR = os.environ.get("WATERH_ADDR", "A4:C1:38:32:D7:DE")
 NOTIFY_CHAR = "0000ffe4-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9b34fb"
-SYNC_CMD = bytes([0x04])
+SYNC_CMD = bytes([0x03])
 POLL_INTERVAL = int(os.environ.get("WATERH_POLL_INTERVAL", "30"))
 API_URL = os.environ.get("WATERH_API_URL", "https://water.syl.rest/api/ingest")
 API_TOKEN = os.environ.get("WATERH_API_TOKEN", "")
@@ -133,13 +133,11 @@ def push_to_remote(db):
 
 # --- Packet parsers ---
 
-def parse_pt(data: bytes):
-    """Parse PT (Past Telemetry) — sip history records."""
-    if len(data) < 6:
-        return []
-
-    payload = data[6:]
+def parse_pt(payload: bytes):
+    """Parse PT payload — sip history records (header already stripped)."""
     record_size = 13
+    if len(payload) < record_size:
+        return []
     records = []
 
     for i in range(0, len(payload) - record_size + 1, record_size):
@@ -199,8 +197,6 @@ async def ble_loop():
                 await client.start_notify(NOTIFY_CHAR, on_notify)
 
                 while client.is_connected:
-                    pending_packets.clear()
-
                     try:
                         await client.write_gatt_char(WRITE_CHAR, SYNC_CMD, response=False)
                     except Exception as e:
@@ -209,17 +205,29 @@ async def ble_loop():
 
                     await asyncio.sleep(3)
 
+                    packets = list(pending_packets)
+                    pending_packets.clear()
+
                     rt_raw = None
                     rp_raw = None
-                    sips = []
+                    pt_payload = b""
+                    in_pt = False
 
-                    for pkt in pending_packets:
+                    for pkt in packets:
                         if pkt[:2] == b"RT":
                             rt_raw = pkt.hex(" ")
+                            in_pt = False
                         elif pkt[:2] == b"RP":
                             rp_raw = pkt.hex(" ")
+                            in_pt = False
                         elif pkt[:2] == b"PT":
-                            sips = parse_pt(pkt)
+                            pt_payload = pkt[6:]  # skip 6-byte PT header
+                            in_pt = True
+                        elif in_pt:
+                            pt_payload += pkt[2:]  # skip 2-byte continuation header
+
+                    print(f"[BLE] {len(packets)} pkts, types: {[p[:2].hex() for p in packets]}, pt_payload: {len(pt_payload)}B")
+                    sips = parse_pt(pt_payload)
 
                     new_count = store_sips(db, sips, rt_raw, rp_raw)
                     total_today = db.execute(

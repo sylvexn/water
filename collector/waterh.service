@@ -10,7 +10,7 @@ ExecStart=/usr/bin/python3 /opt/waterh/collector.py
 WorkingDirectory=/opt/waterh
 Restart=always
 RestartSec=10
-WatchdogSec=120
+Environment=PYTHONUNBUFFERED=1
 
 Environment=WATERH_ADDR=A4:C1:38:32:D7:DE
 Environment=WATERH_POLL_INTERVAL=30
