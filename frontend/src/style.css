@@ -337,6 +337,12 @@ tbody tr {
 }
 .about-content a { color: var(--accent); text-decoration: none; }
 .about-content a:hover { text-decoration: underline; }
+.github-link a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.github-link svg { vertical-align: middle; }
 
 /* --- Mobile --- */
 @media (max-width: 480px) {
