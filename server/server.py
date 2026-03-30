@@ -206,8 +206,8 @@ def status():
     online = False
     if last_sync:
         try:
-            dt = datetime.fromisoformat(last_sync)
-            online = (datetime.now() - dt).total_seconds() < 120
+            dt = datetime.fromisoformat(last_sync).replace(tzinfo=timezone.utc)
+            online = (datetime.now(timezone.utc) - dt).total_seconds() < 120
         except ValueError:
             pass
     return {"online": online, "last_sync": last_sync}
