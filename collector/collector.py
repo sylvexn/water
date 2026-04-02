@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-WaterH BLE Collector
-Connects to the bottle, polls every 30s, stores in local SQLite,
-and pushes new sips to the remote API server.
+WaterH BLE Collector — full app-protocol implementation.
+
+Replicates the official WaterH app's sync flow:
+  1. Clean BlueZ state (remove stale connections)
+  2. Connect (no pairing)
+  3. Request bottle info
+  4. Sync time + goal + reminder settings
+  5. Request water logs (sip history)
+  6. Ack received logs (clears them from bottle storage)
+  7. Push new sips to remote API
 """
 
 import asyncio
@@ -30,16 +37,91 @@ log = logging.getLogger("waterh")
 BOTTLE_ADDR = os.environ.get("WATERH_ADDR", "A4:C1:38:32:D7:DE")
 NOTIFY_CHAR = "0000ffe4-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9b34fb"
-SYNC_CMD = bytes([0x03])
-POLL_INTERVAL = int(os.environ.get("WATERH_POLL_INTERVAL", "30"))
+POLL_INTERVAL = int(os.environ.get("WATERH_POLL_INTERVAL", "60"))
+GOAL_ML = int(os.environ.get("WATERH_GOAL_ML", "2500"))
 API_URL = os.environ.get("WATERH_API_URL", "https://water.syl.rest/api/ingest")
 HEARTBEAT_URL = os.environ.get("WATERH_HEARTBEAT_URL", "https://water.syl.rest/api/heartbeat")
 API_TOKEN = os.environ.get("WATERH_API_TOKEN", "")
 DB_PATH = os.environ.get("WATERH_DB_PATH", str(Path(__file__).parent / "waterh.db"))
 
 MAX_SCAN_FAILURES = 3
-BACKOFF_BASE = 5       # seconds
-BACKOFF_CAP = 300      # 5 minutes
+MAX_EMPTY_POLLS = 5
+BACKOFF_BASE = 5
+BACKOFF_CAP = 300
+
+
+# --- Protocol commands ---
+
+def cmd_bottle_data() -> bytes:
+    return bytes.fromhex("47540001ff")
+
+
+def cmd_sync_settings(goal_ml: int = GOAL_ML) -> bytes:
+    now = datetime.now()
+    goal_hex = f"{goal_ml:04x}"
+    reminder_hex = "00080014003c"
+    time_hex = (
+        f"{(now.year - 2000):02x}"
+        f"{now.month:02x}"
+        f"{now.day:02x}"
+        f"{now.hour:02x}"
+        f"{now.minute:02x}"
+        f"{now.second:02x}"
+    )
+    return bytes.fromhex(f"505400140305{goal_hex}0703{time_hex}0726{reminder_hex}")
+
+
+def cmd_request_water_logs() -> bytes:
+    return bytes.fromhex("4754000106")
+
+
+def cmd_ack_water_logs(total_bytes: int) -> bytes:
+    return bytes.fromhex(f"525000040306{total_bytes:04x}")
+
+
+def cmd_sync_today_amount(ml: int) -> bytes:
+    return bytes.fromhex(f"505400040304{ml:04x}")
+
+
+def cmd_clear_offline() -> bytes:
+    return bytes.fromhex("50540003021c05")
+
+
+# --- BlueZ cleanup (what Android does with gatt.close() + refreshDeviceCache) ---
+
+def bluez_remove_device(addr: str):
+    """Remove device from BlueZ to clear stale connections and GATT cache.
+    This is the Linux equivalent of Android's gatt.close() + refreshDeviceCache().
+    Without this, BlueZ can hold zombie connections that prevent the bottle
+    from advertising."""
+    log.info(f"[BLE] Clearing BlueZ state for {addr}")
+    try:
+        subprocess.run(
+            ["bluetoothctl", "remove", addr],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        pass  # device might not exist in bluez, that's fine
+
+
+def bluez_power_cycle():
+    """Power cycle the Bluetooth adapter."""
+    log.warning("[BLE] Power cycling Bluetooth adapter")
+    try:
+        subprocess.run(["bluetoothctl", "power", "off"], capture_output=True, timeout=5)
+        time.sleep(1)
+        subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=5)
+        time.sleep(2)
+    except Exception as e:
+        log.error(f"[BLE] Power cycle failed: {e}")
+
+
+def bluez_full_reset(addr: str):
+    """Full cleanup: remove device + power cycle. Use before reconnecting
+    after a stale/zombie connection."""
+    bluez_remove_device(addr)
+    time.sleep(1)
+    bluez_power_cycle()
 
 
 # --- Database ---
@@ -52,7 +134,7 @@ def init_db():
             timestamp TEXT UNIQUE NOT NULL,
             intake_ml INTEGER NOT NULL,
             temp_c REAL,
-            unknown INTEGER,
+            tds INTEGER,
             raw_hex TEXT,
             synced INTEGER DEFAULT 0
         )
@@ -61,43 +143,44 @@ def init_db():
         CREATE TABLE IF NOT EXISTS syncs (
             id INTEGER PRIMARY KEY,
             timestamp TEXT NOT NULL,
-            rt_raw TEXT,
-            rp_raw TEXT,
-            sip_count INTEGER
+            sip_count INTEGER,
+            new_count INTEGER,
+            acked_bytes INTEGER
         )
     """)
     db.commit()
     return db
 
 
-def store_sips(db, sips, rt_raw=None, rp_raw=None):
-    """Store sips, deduplicating by timestamp. Returns count of new sips."""
+def store_sips(db, sips):
     new_count = 0
     for sip in sips:
         try:
             db.execute(
-                "INSERT INTO sips (timestamp, intake_ml, temp_c, unknown, raw_hex) VALUES (?, ?, ?, ?, ?)",
-                (sip["timestamp"], sip["intake_ml"], sip["temp_c"], sip["unknown"], sip["raw"]),
+                "INSERT INTO sips (timestamp, intake_ml, temp_c, tds, raw_hex) VALUES (?, ?, ?, ?, ?)",
+                (sip["timestamp"], sip["intake_ml"], sip["temp_c"], sip["tds"], sip["raw"]),
             )
             new_count += 1
         except sqlite3.IntegrityError:
-            pass  # duplicate timestamp, skip
-
-    db.execute(
-        "INSERT INTO syncs (timestamp, rt_raw, rp_raw, sip_count) VALUES (?, ?, ?, ?)",
-        (datetime.now().isoformat(), rt_raw, rp_raw, len(sips)),
-    )
+            pass
     db.commit()
     return new_count
 
 
+def log_sync(db, sip_count, new_count, acked_bytes):
+    db.execute(
+        "INSERT INTO syncs (timestamp, sip_count, new_count, acked_bytes) VALUES (?, ?, ?, ?)",
+        (datetime.now().isoformat(), sip_count, new_count, acked_bytes),
+    )
+    db.commit()
+
+
 def get_unsynced(db):
-    """Get sips not yet pushed to remote."""
     rows = db.execute(
-        "SELECT id, timestamp, intake_ml, temp_c, unknown, raw_hex FROM sips WHERE synced = 0"
+        "SELECT id, timestamp, intake_ml, temp_c, tds, raw_hex FROM sips WHERE synced = 0"
     ).fetchall()
     return [
-        {"id": r[0], "timestamp": r[1], "intake_ml": r[2], "temp_c": r[3], "unknown": r[4], "raw_hex": r[5]}
+        {"id": r[0], "timestamp": r[1], "intake_ml": r[2], "temp_c": r[3], "tds": r[4], "raw_hex": r[5]}
         for r in rows
     ]
 
@@ -113,25 +196,17 @@ def mark_synced(db, ids):
 # --- Remote push ---
 
 def push_to_remote(db):
-    """Push unsynced sips to the API server."""
     if not API_TOKEN:
         return
-
     unsynced = get_unsynced(db)
     if not unsynced:
         return
-
     payload = json.dumps({"sips": unsynced}).encode()
     req = urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_TOKEN}",
-        },
+        API_URL, data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_TOKEN}"},
         method="POST",
     )
-
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status == 200:
@@ -140,99 +215,64 @@ def push_to_remote(db):
                 log.info(f"[PUSH] Pushed {len(ids)} sips to remote")
             else:
                 log.warning(f"[PUSH] Remote returned {resp.status}")
-    except urllib.error.URLError as e:
-        log.warning(f"[PUSH] Failed: {e}")
     except Exception as e:
-        log.error(f"[PUSH] Error: {e}")
+        log.warning(f"[PUSH] Failed: {e}")
 
 
 # --- Heartbeat ---
 
 def post_heartbeat(state: str, detail: str = ""):
-    """POST collector state to backend. Fire-and-forget, never raises."""
     if not API_TOKEN:
         return
     payload = json.dumps({
-        "state": state,
-        "detail": detail,
+        "state": state, "detail": detail,
         "timestamp": datetime.now().isoformat(),
     }).encode()
     req = urllib.request.Request(
-        HEARTBEAT_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_TOKEN}",
-        },
+        HEARTBEAT_URL, data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_TOKEN}"},
         method="POST",
     )
     try:
         urllib.request.urlopen(req, timeout=5)
     except Exception:
-        pass  # best-effort
+        pass
 
 
-# --- Adapter reset ---
+# --- Packet parsing ---
 
-def reset_adapter():
-    """Reset the Bluetooth adapter to recover from a wedged BlueZ stack."""
-    log.warning("[BLE] Resetting hci0 adapter")
-    try:
-        subprocess.run(["hciconfig", "hci0", "reset"], check=True, timeout=10)
-        time.sleep(2)
-    except FileNotFoundError:
-        log.warning("[BLE] hciconfig not found, trying bluetoothctl")
-        try:
-            subprocess.run(["bluetoothctl", "power", "off"], check=True, timeout=5)
-            time.sleep(1)
-            subprocess.run(["bluetoothctl", "power", "on"], check=True, timeout=5)
-            time.sleep(2)
-        except Exception as e:
-            log.error(f"[BLE] bluetoothctl reset failed: {e}")
-    except Exception as e:
-        log.error(f"[BLE] Adapter reset failed: {e}")
+def parse_pt_packets(packets: list[bytes]) -> tuple[list[dict], int]:
+    pt_payload = b""
+    in_pt = False
+    for pkt in packets:
+        if len(pkt) >= 2 and pkt[0] == 0x50 and pkt[1] == 0x54:
+            pt_payload = pkt[6:]
+            in_pt = True
+        elif in_pt and len(pkt) >= 2:
+            pt_payload += pkt[2:]
 
-
-# --- Packet parsers ---
-
-def parse_pt(payload: bytes):
-    """Parse PT payload — sip history records (header already stripped)."""
-    record_size = 13
-    if len(payload) < record_size:
-        return []
     records = []
-
-    for i in range(0, len(payload) - record_size + 1, record_size):
-        rec = payload[i : i + record_size]
+    record_size = 13
+    for i in range(0, len(pt_payload) - record_size + 1, record_size):
+        rec = pt_payload[i : i + record_size]
         year = 2000 + rec[0]
-        month = rec[1]
-        day = rec[2]
-        hour = rec[3]
-        minute = rec[4]
-        second = rec[5]
+        month, day = rec[1], rec[2]
+        hour, minute, second = rec[3], rec[4], rec[5]
         intake_ml = (rec[6] << 8) | rec[7]
-        unknown = (rec[8] << 8) | rec[9]
-        temp_raw = (rec[10] << 8) | rec[11]
-        temp_c = temp_raw / 10.0
-
+        tds = (rec[8] << 8) | rec[9]
+        temp_c = ((rec[10] << 8) | rec[11]) / 10.0
         try:
-            ts = datetime(year, month, day, hour, minute, second)
-            timestamp = ts.isoformat()
+            ts = datetime(year, month, day, hour, minute, second).isoformat()
         except ValueError:
-            timestamp = f"{year}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}"
-
+            ts = f"{year}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}"
         records.append({
-            "timestamp": timestamp,
-            "intake_ml": intake_ml,
-            "temp_c": temp_c,
-            "unknown": unknown,
-            "raw": rec.hex(" "),
+            "timestamp": ts, "intake_ml": intake_ml,
+            "temp_c": temp_c, "tds": tds, "raw": rec.hex(" "),
         })
+    return records, len(pt_payload)
 
-    return records
 
-
-# --- Queue helpers ---
+# --- BLE helpers ---
 
 def drain_queue(q: asyncio.Queue) -> list[bytes]:
     items = []
@@ -244,7 +284,89 @@ def drain_queue(q: asyncio.Queue) -> list[bytes]:
     return items
 
 
-# --- BLE ---
+async def ble_write(client, cmd: bytes, label: str):
+    log.info(f"[BLE] >> {label} ({cmd.hex(' ')})")
+    await client.write_gatt_char(WRITE_CHAR, cmd, response=False)
+
+
+async def ble_write_and_wait(client, cmd: bytes, label: str, queue: asyncio.Queue, wait: float = 2.0) -> list[bytes]:
+    drain_queue(queue)
+    await ble_write(client, cmd, label)
+    await asyncio.sleep(wait)
+    return drain_queue(queue)
+
+
+# --- Sync cycle ---
+
+async def sync_cycle(client, queue: asyncio.Queue, db) -> bool:
+    # Step 1: Request bottle data
+    pkts = await ble_write_and_wait(client, cmd_bottle_data(), "bottle-data", queue, wait=2.0)
+    rp_pkts = [p for p in pkts if len(p) >= 2 and p[0] == 0x52 and p[1] == 0x50]
+    if rp_pkts:
+        rp = rp_pkts[0]
+        if len(rp) > 31:
+            log.info(f"[BLE] Battery: {rp[6]}%, charging: {rp[31]}")
+    else:
+        log.warning("[BLE] No bottle data response")
+
+    # Step 2: Sync settings (time + goal + reminder)
+    pkts = await ble_write_and_wait(client, cmd_sync_settings(), "sync-settings", queue, wait=2.0)
+    rp_pkts = [p for p in pkts if len(p) >= 2 and p[0] == 0x52 and p[1] == 0x50]
+    if rp_pkts:
+        rp = rp_pkts[0]
+        sync_ok = len(rp) > 10 and rp[10] == 0x00
+        log.info(f"[BLE] Settings sync: {'ok' if sync_ok else 'check response'}")
+
+    # Step 3: Sync today's amount to bottle display
+    total_today = db.execute(
+        "SELECT COALESCE(SUM(intake_ml), 0) FROM sips WHERE DATE(timestamp) = DATE('now')"
+    ).fetchone()[0]
+    await ble_write_and_wait(client, cmd_sync_today_amount(total_today), "sync-display", queue, wait=1.0)
+
+    # Step 4: Request water logs
+    pkts = await ble_write_and_wait(client, cmd_request_water_logs(), "request-logs", queue, wait=4.0)
+
+    has_data = False
+    for p in pkts:
+        if len(p) >= 7 and p[0] == 0x52 and p[1] == 0x50 and p[5] == 0x06:
+            has_data = p[6] == 0x01
+            log.info(f"[BLE] Water logs: {'data found' if has_data else 'no data'}")
+
+    if not has_data:
+        log.info(f"[BLE] No new water logs, {total_today}ml today")
+        log_sync(db, 0, 0, 0)
+        return True
+
+    # Step 5: Collect all PT packets
+    all_packets = list(pkts)
+    await asyncio.sleep(2.0)
+    all_packets.extend(drain_queue(queue))
+
+    sips, pt_bytes = parse_pt_packets(all_packets)
+    log.info(f"[BLE] Received {len(sips)} sip records ({pt_bytes}B)")
+
+    # Step 6: Store locally
+    new_count = store_sips(db, sips)
+    total_today = db.execute(
+        "SELECT COALESCE(SUM(intake_ml), 0) FROM sips WHERE DATE(timestamp) = DATE('now')"
+    ).fetchone()[0]
+    log.info(f"[BLE] Stored {len(sips)} sips ({new_count} new), {total_today}ml today")
+
+    # Step 7: Ack + clear from bottle
+    if sips:
+        ack_bytes = len(sips) * 13
+        await ble_write_and_wait(client, cmd_ack_water_logs(ack_bytes), "ack-logs", queue, wait=1.0)
+        log.info(f"[BLE] Acked {ack_bytes}B ({len(sips)} records)")
+
+    # Step 8: Update bottle display with new total
+    await ble_write_and_wait(client, cmd_sync_today_amount(total_today), "sync-display", queue, wait=1.0)
+
+    log_sync(db, len(sips), new_count, len(sips) * 13 if sips else 0)
+    push_to_remote(db)
+    return True
+
+
+# --- BLE main loop ---
 
 async def ble_loop():
     db = init_db()
@@ -256,8 +378,11 @@ async def ble_loop():
 
     post_heartbeat("starting")
 
+    # Clean start: remove any stale BlueZ state from previous runs
+    bluez_remove_device(BOTTLE_ADDR)
+
     while True:
-        # --- Scan phase ---
+        # --- Scan ---
         log.info(f"[BLE] Scanning for {BOTTLE_ADDR}...")
         post_heartbeat("scanning")
 
@@ -270,24 +395,26 @@ async def ble_loop():
         if not device:
             scan_failures += 1
             if scan_failures >= MAX_SCAN_FAILURES:
-                reset_adapter()
+                # Full reset: remove device + power cycle adapter
+                bluez_full_reset(BOTTLE_ADDR)
                 scan_failures = 0
-
-            log.warning(f"[BLE] Bottle not found (attempt {scan_failures}), retry in {backoff}s")
+            else:
+                # Light cleanup: just remove stale device reference
+                bluez_remove_device(BOTTLE_ADDR)
+            log.warning(f"[BLE] Not found (attempt {scan_failures}), retry in {backoff}s")
             post_heartbeat("scanning", f"not found, retry {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, BACKOFF_CAP)
             continue
 
-        # Successful scan — reset counters
         scan_failures = 0
         backoff = BACKOFF_BASE
 
-        # --- Connect phase ---
+        # --- Connect ---
         disconnected_event = asyncio.Event()
 
         def on_disconnect(client):
-            log.warning("[BLE] Disconnect callback fired")
+            log.warning("[BLE] Disconnected")
             disconnected_event.set()
 
         try:
@@ -300,68 +427,48 @@ async def ble_loop():
 
                 await client.start_notify(NOTIFY_CHAR, on_notify)
 
+                empty_cycles = 0
                 while client.is_connected and not disconnected_event.is_set():
                     try:
-                        await client.write_gatt_char(WRITE_CHAR, SYNC_CMD, response=False)
+                        success = await sync_cycle(client, packet_queue, db)
+                        if success:
+                            empty_cycles = 0
+                            post_heartbeat("connected", "sync ok")
+                        else:
+                            empty_cycles += 1
                     except Exception as e:
-                        log.error(f"[BLE] Write error: {e}")
+                        log.error(f"[BLE] Sync cycle error: {e}")
+                        empty_cycles += 1
+
+                    if empty_cycles >= MAX_EMPTY_POLLS:
+                        log.warning(f"[BLE] {empty_cycles} failed cycles, forcing reconnect")
+                        post_heartbeat("scanning", "stale connection")
                         break
 
-                    await asyncio.sleep(3)
-
-                    packets = drain_queue(packet_queue)
-
-                    rt_raw = None
-                    rp_raw = None
-                    pt_payload = b""
-                    in_pt = False
-
-                    for pkt in packets:
-                        if pkt[:2] == b"RT":
-                            rt_raw = pkt.hex(" ")
-                            in_pt = False
-                        elif pkt[:2] == b"RP":
-                            rp_raw = pkt.hex(" ")
-                            in_pt = False
-                        elif pkt[:2] == b"PT":
-                            pt_payload = pkt[6:]  # skip 6-byte PT header
-                            in_pt = True
-                        elif in_pt:
-                            pt_payload += pkt[2:]  # skip 2-byte continuation header
-
-                    log.info(f"[BLE] {len(packets)} pkts, types: {[p[:2].hex() for p in packets]}, pt_payload: {len(pt_payload)}B")
-                    sips = parse_pt(pt_payload)
-
-                    new_count = store_sips(db, sips, rt_raw, rp_raw)
-                    total_today = db.execute(
-                        "SELECT COALESCE(SUM(intake_ml), 0) FROM sips WHERE DATE(timestamp) = DATE('now')"
-                    ).fetchone()[0]
-
-                    log.info(f"[BLE] Synced — {len(sips)} sips ({new_count} new), {total_today}ml today")
-
-                    push_to_remote(db)
-                    post_heartbeat("connected", f"{len(sips)} sips, {new_count} new")
-
-                    # Reset backoff on successful poll cycle
                     backoff = BACKOFF_BASE
                     await asyncio.sleep(POLL_INTERVAL)
 
         except Exception as e:
-            log.error(f"[BLE] Error: {e}")
+            log.error(f"[BLE] Connection error: {e}")
             post_heartbeat("error", str(e))
 
-        log.info(f"[BLE] Disconnected, reconnecting in {backoff}s...")
-        post_heartbeat("scanning", "disconnected, reconnecting")
+        # Clean up BlueZ state before reconnecting — this is the critical step
+        # that prevents zombie connections. Android does this in gatt.close().
+        log.info(f"[BLE] Cleaning up BlueZ state before reconnect...")
+        bluez_remove_device(BOTTLE_ADDR)
+
+        log.info(f"[BLE] Reconnecting in {backoff}s...")
+        post_heartbeat("scanning", "reconnecting")
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, BACKOFF_CAP)
 
 
 def main():
-    log.info(f"[INIT] WaterH Collector")
+    log.info("[INIT] WaterH Collector (full protocol)")
     log.info(f"[INIT] Bottle: {BOTTLE_ADDR}")
-    log.info(f"[INIT] API: {API_URL}")
-    log.info(f"[INIT] Heartbeat: {HEARTBEAT_URL}")
+    log.info(f"[INIT] Goal: {GOAL_ML}ml")
     log.info(f"[INIT] Poll interval: {POLL_INTERVAL}s")
+    log.info(f"[INIT] API: {API_URL}")
     asyncio.run(ble_loop())
 
 

@@ -7,54 +7,42 @@ Reverse-engineered BLE protocol for the WaterH-Boost-24oz smart water bottle. Li
 ```
 WaterH Bottle ──BLE──▶ Collector (fridge) ──POST──▶ API Server (Coolify VPS)
                         Python + bleak              FastAPI + SQLite
-                        polls every 30s             water.syl.rest
+                        full app-protocol sync      water.syl.rest
                         local SQLite buffer         dashboard + JSON API
 ```
 
-**Collector** connects to the bottle over BLE, sends command `0x04`, parses the notification response (sip history, temperature, device status), deduplicates against local SQLite, and pushes new records to the remote API.
+**Collector** connects to the bottle over BLE, replicates the official WaterH app's full sync protocol (bottle info, time sync, goal + reminder push, water log download, ack + clear, display update), deduplicates against local SQLite, and pushes new records to the remote API. Includes BlueZ zombie connection cleanup for reliable reconnection on Linux.
 
 **Server** receives sip data, stores it, and serves both the dashboard frontend and a JSON API.
 
 ## BLE Protocol
 
-The bottle uses a CC2541-based BLE UART bridge. Two relevant GATT characteristics:
+The bottle uses a CC2541-based BLE UART bridge (no pairing/bonding required). Protocol was reverse-engineered by decompiling the official Android app (`com.waterh` by ABCloudz) with jadx.
 
 | UUID | Direction | Purpose |
 |------|-----------|---------|
-| `0000ffe4` (service `0000ffe0`) | notify, read | Data from bottle |
-| `0000ffe9` (service `0000ffe5`) | write-without-response | Commands to bottle |
+| `0000ffe4` (service `0000ffe0`) | notify | Data from bottle |
+| `0000ffe9` (service `0000ffe5`) | write-no-response | Commands to bottle |
 
-Sending `0x04` triggers a data dump as three notification packets:
+See [protocol.md](protocol.md) for the complete command reference, response formats, sync flow, LED control, sensor data, and BlueZ notes.
 
-| Prefix | Type | Content |
-|--------|------|---------|
-| `RT` | Real-Time | Device status byte |
-| `RP` | Report | Config/firmware info |
-| `PT` | Past Telemetry | Timestamped sip records |
+### What we can control
 
-### Sip Record Format (13 bytes)
-
-```
-Offset  Size  Field
-0       1     Year (offset from 2000)
-1       1     Month
-2       1     Day
-3       1     Hour
-4       1     Minute
-5       1     Second
-6       2     Intake (ml), big-endian
-8       2     Unknown
-10      2     Temperature (C * 10), big-endian
-12      1     Padding
-```
+- Read battery, temperature, TDS (water quality), water volume, charging status
+- Sync time, daily goal, and reminder schedule
+- Push today's intake total → updates the % shown on the bottle's screen
+- Download sip history and clear it from bottle storage (prevents overflow)
+- Set LED mode (default, breathe, calm, rainbow, warmth, christmas) with arbitrary RGB color
+- Flash the LED on demand
+- Recalibrate the water level sensor
+- Send custom text to the bottle's display (text signature — not yet implemented)
 
 ## Project Structure
 
 ```
 collector/          BLE polling service (runs on local host)
-  collector.py      Connect, poll, parse, push to API
+  collector.py      Full app-protocol sync, parse, push to API
   waterh.service    systemd unit
-  install.sh        Setup script
 
 server/             API + dashboard (deployed via Coolify)
   server.py         FastAPI endpoints
@@ -65,11 +53,13 @@ frontend/           Dashboard SPA
   index.html
   Dockerfile        nginx serving static build
 
-research/           Original reverse engineering scripts
+research/           Reverse engineering scripts
   scan.py           BLE device scanner
   enumerate.py      GATT service enumerator
   listen.py         Notification listener
   probe.py          Command fuzzer
+  dump.py           Protocol discovery
+  commands.py       Interactive command tester (all LED modes, display, reminders)
 ```
 
 ## API

@@ -72,6 +72,7 @@ function animateValue(el, value) {
 
 // --- Today ---
 let firstLoad = true;
+let lastSipKey = "";
 
 async function loadToday() {
   if (firstLoad) showSkeleton();
@@ -121,25 +122,30 @@ async function loadToday() {
     document.getElementById("today-bar").style.width = `${data.goal_pct}%`;
 
     const tbody = document.getElementById("sip-table");
+    const sipKey = data.sips.map((s) => s.timestamp).join(",");
 
-    if (data.sips.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="4" class="empty-state">no sips recorded yet today</td></tr>`;
-    } else {
-      const maxMl = Math.max(...data.sips.map((s) => s.intake_ml), 1);
-      tbody.innerHTML = data.sips
-        .slice()
-        .reverse()
-        .map((s, i) => {
-          const t = new Date(s.timestamp).toLocaleTimeString();
-          const pct = Math.round((s.intake_ml / maxMl) * 100);
-          return `<tr style="animation-delay:${i * 0.04}s">
-            <td>${t}</td>
-            <td>${s.intake_ml} ml</td>
-            <td>${s.temp_c ?? "—"}°C</td>
-            <td><div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div></td>
-          </tr>`;
-        })
-        .join("");
+    if (sipKey !== lastSipKey) {
+      lastSipKey = sipKey;
+      if (data.sips.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="4" class="empty-state">no sips recorded yet today</td></tr>`;
+      } else {
+        const maxMl = Math.max(...data.sips.map((s) => s.intake_ml), 1);
+        const animate = firstLoad || sipKey !== lastSipKey;
+        tbody.innerHTML = data.sips
+          .slice()
+          .reverse()
+          .map((s, i) => {
+            const t = new Date(s.timestamp).toLocaleTimeString();
+            const pct = Math.round((s.intake_ml / maxMl) * 100);
+            return `<tr${firstLoad ? ` style="animation-delay:${i * 0.04}s"` : ""}>
+              <td>${t}</td>
+              <td>${s.intake_ml} ml</td>
+              <td>${s.temp_c ?? "—"}°C</td>
+              <td><div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div></td>
+            </tr>`;
+          })
+          .join("");
+      }
     }
 
     firstLoad = false;
