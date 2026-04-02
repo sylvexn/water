@@ -87,10 +87,19 @@ async function loadToday() {
     hideSkeleton();
 
     const el = document.getElementById("status");
-    el.className = `status ${status.online ? "online" : "offline"}`;
-    el.textContent = status.online
-      ? `synced ${timeAgo(status.last_sync)}`
-      : `offline — last sync ${status.last_sync ? timeAgo(status.last_sync) : "never"}`;
+    if (status.state === "connected") {
+      el.className = "status online";
+      el.textContent = `connected — ${timeAgo(status.last_seen)}`;
+    } else if (status.state === "scanning") {
+      el.className = "status online";
+      el.textContent = `scanning — ${status.detail || timeAgo(status.last_seen)}`;
+    } else if (status.online) {
+      el.className = "status online";
+      el.textContent = `synced ${timeAgo(status.last_seen)}`;
+    } else {
+      el.className = "status offline";
+      el.textContent = `offline — ${status.state || "unknown"} ${timeAgo(status.last_seen)}`;
+    }
 
     const mlEl = document.getElementById("today-ml");
     const sipsEl = document.getElementById("today-sips");

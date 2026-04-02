@@ -7,14 +7,24 @@ and pushes new sips to the remote API server.
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
+import subprocess
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime
 from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("waterh")
 
 # --- Config ---
 BOTTLE_ADDR = os.environ.get("WATERH_ADDR", "A4:C1:38:32:D7:DE")
@@ -23,8 +33,13 @@ WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9b34fb"
 SYNC_CMD = bytes([0x03])
 POLL_INTERVAL = int(os.environ.get("WATERH_POLL_INTERVAL", "30"))
 API_URL = os.environ.get("WATERH_API_URL", "https://water.syl.rest/api/ingest")
+HEARTBEAT_URL = os.environ.get("WATERH_HEARTBEAT_URL", "https://water.syl.rest/api/heartbeat")
 API_TOKEN = os.environ.get("WATERH_API_TOKEN", "")
 DB_PATH = os.environ.get("WATERH_DB_PATH", str(Path(__file__).parent / "waterh.db"))
+
+MAX_SCAN_FAILURES = 3
+BACKOFF_BASE = 5       # seconds
+BACKOFF_CAP = 300      # 5 minutes
 
 
 # --- Database ---
@@ -122,13 +137,60 @@ def push_to_remote(db):
             if resp.status == 200:
                 ids = [s["id"] for s in unsynced]
                 mark_synced(db, ids)
-                print(f"[PUSH] Pushed {len(ids)} sips to remote")
+                log.info(f"[PUSH] Pushed {len(ids)} sips to remote")
             else:
-                print(f"[PUSH] Remote returned {resp.status}")
+                log.warning(f"[PUSH] Remote returned {resp.status}")
     except urllib.error.URLError as e:
-        print(f"[PUSH] Failed: {e}")
+        log.warning(f"[PUSH] Failed: {e}")
     except Exception as e:
-        print(f"[PUSH] Error: {e}")
+        log.error(f"[PUSH] Error: {e}")
+
+
+# --- Heartbeat ---
+
+def post_heartbeat(state: str, detail: str = ""):
+    """POST collector state to backend. Fire-and-forget, never raises."""
+    if not API_TOKEN:
+        return
+    payload = json.dumps({
+        "state": state,
+        "detail": detail,
+        "timestamp": datetime.now().isoformat(),
+    }).encode()
+    req = urllib.request.Request(
+        HEARTBEAT_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_TOKEN}",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # best-effort
+
+
+# --- Adapter reset ---
+
+def reset_adapter():
+    """Reset the Bluetooth adapter to recover from a wedged BlueZ stack."""
+    log.warning("[BLE] Resetting hci0 adapter")
+    try:
+        subprocess.run(["hciconfig", "hci0", "reset"], check=True, timeout=10)
+        time.sleep(2)
+    except FileNotFoundError:
+        log.warning("[BLE] hciconfig not found, trying bluetoothctl")
+        try:
+            subprocess.run(["bluetoothctl", "power", "off"], check=True, timeout=5)
+            time.sleep(1)
+            subprocess.run(["bluetoothctl", "power", "on"], check=True, timeout=5)
+            time.sleep(2)
+        except Exception as e:
+            log.error(f"[BLE] bluetoothctl reset failed: {e}")
+    except Exception as e:
+        log.error(f"[BLE] Adapter reset failed: {e}")
 
 
 # --- Packet parsers ---
@@ -170,43 +232,84 @@ def parse_pt(payload: bytes):
     return records
 
 
+# --- Queue helpers ---
+
+def drain_queue(q: asyncio.Queue) -> list[bytes]:
+    items = []
+    while not q.empty():
+        try:
+            items.append(q.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    return items
+
+
 # --- BLE ---
-
-pending_packets = []
-
-
-def on_notify(sender, data: bytearray):
-    pending_packets.append(bytes(data))
-
 
 async def ble_loop():
     db = init_db()
-    print(f"[DB] Initialized at {DB_PATH}")
+    log.info(f"[DB] Initialized at {DB_PATH}")
+
+    packet_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    scan_failures = 0
+    backoff = BACKOFF_BASE
+
+    post_heartbeat("starting")
 
     while True:
-        try:
-            print(f"[BLE] Scanning for {BOTTLE_ADDR}...")
-            device = await BleakScanner.find_device_by_address(BOTTLE_ADDR, timeout=15)
-            if not device:
-                print("[BLE] Bottle not found, retrying in 10s...")
-                await asyncio.sleep(10)
-                continue
+        # --- Scan phase ---
+        log.info(f"[BLE] Scanning for {BOTTLE_ADDR}...")
+        post_heartbeat("scanning")
 
-            async with BleakClient(device) as client:
-                print(f"[BLE] Connected to {device.name}")
+        try:
+            device = await BleakScanner.find_device_by_address(BOTTLE_ADDR, timeout=15)
+        except Exception as e:
+            log.error(f"[BLE] Scan error: {e}")
+            device = None
+
+        if not device:
+            scan_failures += 1
+            if scan_failures >= MAX_SCAN_FAILURES:
+                reset_adapter()
+                scan_failures = 0
+
+            log.warning(f"[BLE] Bottle not found (attempt {scan_failures}), retry in {backoff}s")
+            post_heartbeat("scanning", f"not found, retry {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_CAP)
+            continue
+
+        # Successful scan — reset counters
+        scan_failures = 0
+        backoff = BACKOFF_BASE
+
+        # --- Connect phase ---
+        disconnected_event = asyncio.Event()
+
+        def on_disconnect(client):
+            log.warning("[BLE] Disconnect callback fired")
+            disconnected_event.set()
+
+        try:
+            async with BleakClient(device, disconnected_callback=on_disconnect) as client:
+                log.info(f"[BLE] Connected to {device.name}")
+                post_heartbeat("connected")
+
+                def on_notify(sender, data: bytearray):
+                    packet_queue.put_nowait(bytes(data))
+
                 await client.start_notify(NOTIFY_CHAR, on_notify)
 
-                while client.is_connected:
+                while client.is_connected and not disconnected_event.is_set():
                     try:
                         await client.write_gatt_char(WRITE_CHAR, SYNC_CMD, response=False)
                     except Exception as e:
-                        print(f"[BLE] Write error: {e}")
+                        log.error(f"[BLE] Write error: {e}")
                         break
 
                     await asyncio.sleep(3)
 
-                    packets = list(pending_packets)
-                    pending_packets.clear()
+                    packets = drain_queue(packet_queue)
 
                     rt_raw = None
                     rp_raw = None
@@ -226,7 +329,7 @@ async def ble_loop():
                         elif in_pt:
                             pt_payload += pkt[2:]  # skip 2-byte continuation header
 
-                    print(f"[BLE] {len(packets)} pkts, types: {[p[:2].hex() for p in packets]}, pt_payload: {len(pt_payload)}B")
+                    log.info(f"[BLE] {len(packets)} pkts, types: {[p[:2].hex() for p in packets]}, pt_payload: {len(pt_payload)}B")
                     sips = parse_pt(pt_payload)
 
                     new_count = store_sips(db, sips, rt_raw, rp_raw)
@@ -234,23 +337,31 @@ async def ble_loop():
                         "SELECT COALESCE(SUM(intake_ml), 0) FROM sips WHERE DATE(timestamp) = DATE('now')"
                     ).fetchone()[0]
 
-                    print(f"[BLE] Synced — {len(sips)} sips ({new_count} new), {total_today}ml today")
+                    log.info(f"[BLE] Synced — {len(sips)} sips ({new_count} new), {total_today}ml today")
 
                     push_to_remote(db)
+                    post_heartbeat("connected", f"{len(sips)} sips, {new_count} new")
+
+                    # Reset backoff on successful poll cycle
+                    backoff = BACKOFF_BASE
                     await asyncio.sleep(POLL_INTERVAL)
 
         except Exception as e:
-            print(f"[BLE] Error: {e}")
+            log.error(f"[BLE] Error: {e}")
+            post_heartbeat("error", str(e))
 
-        print("[BLE] Disconnected, reconnecting in 5s...")
-        await asyncio.sleep(5)
+        log.info(f"[BLE] Disconnected, reconnecting in {backoff}s...")
+        post_heartbeat("scanning", "disconnected, reconnecting")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, BACKOFF_CAP)
 
 
 def main():
-    print(f"[INIT] WaterH Collector")
-    print(f"[INIT] Bottle: {BOTTLE_ADDR}")
-    print(f"[INIT] API: {API_URL}")
-    print(f"[INIT] Poll interval: {POLL_INTERVAL}s")
+    log.info(f"[INIT] WaterH Collector")
+    log.info(f"[INIT] Bottle: {BOTTLE_ADDR}")
+    log.info(f"[INIT] API: {API_URL}")
+    log.info(f"[INIT] Heartbeat: {HEARTBEAT_URL}")
+    log.info(f"[INIT] Poll interval: {POLL_INTERVAL}s")
     asyncio.run(ble_loop())
 
 

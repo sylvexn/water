@@ -16,7 +16,10 @@ Environment=WATERH_ADDR=A4:C1:38:32:D7:DE
 Environment=WATERH_POLL_INTERVAL=30
 Environment=WATERH_DB_PATH=/opt/waterh/waterh.db
 Environment=WATERH_API_URL=https://water.syl.rest/api/ingest
+Environment=WATERH_HEARTBEAT_URL=https://water.syl.rest/api/heartbeat
 EnvironmentFile=-/opt/waterh/.env
+
+AmbientCapabilities=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
