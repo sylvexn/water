@@ -125,26 +125,64 @@ async function loadToday() {
     const sipKey = data.sips.map((s) => s.timestamp).join(",");
 
     if (sipKey !== lastSipKey) {
+      const prevKey = lastSipKey;
       lastSipKey = sipKey;
       if (data.sips.length === 0) {
         tbody.innerHTML = `<tr><td colspan="4" class="empty-state">no sips recorded yet today</td></tr>`;
       } else {
+        const reversed = data.sips.slice().reverse();
         const maxMl = Math.max(...data.sips.map((s) => s.intake_ml), 1);
-        const animate = firstLoad || sipKey !== lastSipKey;
-        tbody.innerHTML = data.sips
-          .slice()
-          .reverse()
-          .map((s, i) => {
-            const t = new Date(s.timestamp).toLocaleTimeString();
-            const pct = Math.round((s.intake_ml / maxMl) * 100);
-            return `<tr${firstLoad ? ` style="animation-delay:${i * 0.04}s"` : ""}>
+
+        if (firstLoad) {
+          // First load: render all rows with staggered animation
+          tbody.innerHTML = reversed
+            .map((s, i) => {
+              const t = new Date(s.timestamp).toLocaleTimeString();
+              const pct = Math.round((s.intake_ml / maxMl) * 100);
+              return `<tr class="animate-in" style="animation-delay:${i * 0.04}s">
               <td>${t}</td>
               <td>${s.intake_ml} ml</td>
               <td>${s.temp_c ?? "—"}°C</td>
               <td><div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div></td>
             </tr>`;
-          })
-          .join("");
+            })
+            .join("");
+        } else {
+          // Subsequent updates: find new sips and prepend them with animation
+          const prevTimestamps = new Set(prevKey ? prevKey.split(",") : []);
+          const newSips = reversed.filter((s) => !prevTimestamps.has(s.timestamp));
+
+          if (newSips.length > 0) {
+            // Remove animate-in class from existing rows
+            tbody.querySelectorAll("tr.animate-in").forEach((tr) => tr.classList.remove("animate-in"));
+
+            const fragment = document.createDocumentFragment();
+            newSips.forEach((s, i) => {
+              const tr = document.createElement("tr");
+              tr.className = "animate-in";
+              tr.style.animationDelay = `${i * 0.04}s`;
+              const t = new Date(s.timestamp).toLocaleTimeString();
+              const pct = Math.round((s.intake_ml / maxMl) * 100);
+              tr.innerHTML = `
+              <td>${t}</td>
+              <td>${s.intake_ml} ml</td>
+              <td>${s.temp_c ?? "—"}°C</td>
+              <td><div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div></td>`;
+              fragment.appendChild(tr);
+            });
+            tbody.insertBefore(fragment, tbody.firstChild);
+
+            // Update bar widths for all rows since maxMl may have changed
+            tbody.querySelectorAll("tr").forEach((tr, i) => {
+              const sip = reversed[i];
+              if (sip) {
+                const pct = Math.round((sip.intake_ml / maxMl) * 100);
+                const fill = tr.querySelector(".bar-fill");
+                if (fill) fill.style.width = `${pct}%`;
+              }
+            });
+          }
+        }
       }
     }
 

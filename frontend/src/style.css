@@ -163,7 +163,7 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
   to { opacity: 1; transform: translateY(0); }
 }
 
-tbody tr {
+tbody tr.animate-in {
   animation: fadeSlideIn 0.25s ease both;
 }
 

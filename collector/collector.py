@@ -44,6 +44,8 @@ HEARTBEAT_URL = os.environ.get("WATERH_HEARTBEAT_URL", "https://water.syl.rest/a
 API_TOKEN = os.environ.get("WATERH_API_TOKEN", "")
 DB_PATH = os.environ.get("WATERH_DB_PATH", str(Path(__file__).parent / "waterh.db"))
 
+CMD_PORT = int(os.environ.get("WATERH_CMD_PORT", "7700"))
+
 MAX_SCAN_FAILURES = 3
 MAX_EMPTY_POLLS = 5
 BACKOFF_BASE = 5
@@ -85,6 +87,166 @@ def cmd_sync_today_amount(ml: int) -> bytes:
 
 def cmd_clear_offline() -> bytes:
     return bytes.fromhex("50540003021c05")
+
+
+def cmd_flash_led() -> bytes:
+    return bytes.fromhex("50540003021d01")
+
+
+def cmd_set_led(mode: str, color: str) -> bytes:
+    modes = {
+        "default": "00", "breathe": "01", "calm": "02",
+        "rainbow": "03", "warmth": "05", "christmas": "06",
+    }
+    colors = {
+        "red": "ff0000", "yellow": "ffff00", "green": "00ff00",
+        "cyan": "00ffff", "blue": "0000ff", "purple": "ff00ff",
+        "white": "ffffff",
+    }
+    mode_hex = modes.get(mode, "00")
+    # Accept named color or raw hex
+    color_hex = colors.get(color, color if len(color) == 6 else "0000ff")
+    return bytes.fromhex(f"5054000605fb{mode_hex}{color_hex}")
+
+
+def cmd_set_reminder(on: bool, wake_h: int, wake_m: int, sleep_h: int, sleep_m: int, interval_min: int) -> bytes:
+    type_byte = "01" if on else "00"
+    return bytes.fromhex(
+        f"505400080726{type_byte}"
+        f"{wake_h:02x}{wake_m:02x}"
+        f"{sleep_h:02x}{sleep_m:02x}"
+        f"{interval_min:02x}"
+    )
+
+
+def cmd_set_goal(ml: int) -> bytes:
+    return bytes.fromhex(f"505400040305{ml:04x}")
+
+
+def cmd_recalibrate(full: bool) -> bytes:
+    return bytes.fromhex("5054000302A101" if full else "5054000302A601")
+
+
+# --- Command queue (shared between HTTP server and BLE loop) ---
+# Initialized in ble_loop() once the event loop is running.
+
+cmd_queue: asyncio.Queue[tuple[bytes, str]] | None = None
+
+
+# --- Command HTTP server ---
+
+async def handle_cmd_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Minimal HTTP handler for /commands endpoint."""
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+        request_str = request_line.decode(errors="replace")
+        # Read headers
+        content_length = 0
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if line in (b"\r\n", b"\n", b""):
+                break
+            if line.lower().startswith(b"content-length:"):
+                content_length = int(line.split(b":")[1].strip())
+
+        body = b""
+        if content_length > 0:
+            body = await asyncio.wait_for(reader.readexactly(content_length), timeout=5)
+
+        method = request_str.split(" ")[0] if request_str else ""
+        path = request_str.split(" ")[1] if len(request_str.split(" ")) > 1 else "/"
+
+        if method == "GET" and path == "/commands":
+            resp = {"commands": [
+                "POST /commands/flash",
+                "POST /commands/led    {mode, color}",
+                "POST /commands/goal   {ml}",
+                "POST /commands/intake {ml}",
+                "POST /commands/reminder {on, wake, sleep, interval}",
+                "POST /commands/calibrate {full}",
+                "POST /commands/raw    {hex}",
+            ]}
+            send_json(writer, 200, resp)
+
+        elif method == "POST" and path == "/commands/flash":
+            cmd_queue.put_nowait((cmd_flash_led(), "flash"))
+            send_json(writer, 200, {"ok": True, "queued": "flash"})
+
+        elif method == "POST" and path == "/commands/led":
+            data = json.loads(body) if body else {}
+            mode = data.get("mode", "default")
+            color = data.get("color", "blue")
+            cmd_queue.put_nowait((cmd_set_led(mode, color), f"led {mode} {color}"))
+            send_json(writer, 200, {"ok": True, "queued": f"led {mode} {color}"})
+
+        elif method == "POST" and path == "/commands/goal":
+            data = json.loads(body) if body else {}
+            ml = int(data.get("ml", GOAL_ML))
+            cmd_queue.put_nowait((cmd_set_goal(ml), f"goal {ml}ml"))
+            send_json(writer, 200, {"ok": True, "queued": f"goal {ml}ml"})
+
+        elif method == "POST" and path == "/commands/intake":
+            data = json.loads(body) if body else {}
+            ml = int(data.get("ml", 0))
+            cmd_queue.put_nowait((cmd_sync_today_amount(ml), f"intake {ml}ml"))
+            send_json(writer, 200, {"ok": True, "queued": f"intake {ml}ml"})
+
+        elif method == "POST" and path == "/commands/reminder":
+            data = json.loads(body) if body else {}
+            on = data.get("on", False)
+            wake = data.get("wake", "08:00").split(":")
+            slp = data.get("sleep", "20:00").split(":")
+            interval = int(data.get("interval", 60))
+            cmd = cmd_set_reminder(on, int(wake[0]), int(wake[1]), int(slp[0]), int(slp[1]), interval)
+            label = f"reminder {'on' if on else 'off'}"
+            cmd_queue.put_nowait((cmd, label))
+            send_json(writer, 200, {"ok": True, "queued": label})
+
+        elif method == "POST" and path == "/commands/calibrate":
+            data = json.loads(body) if body else {}
+            full = data.get("full", True)
+            cmd_queue.put_nowait((cmd_recalibrate(full), f"calibrate {'full' if full else 'empty'}"))
+            send_json(writer, 200, {"ok": True, "queued": f"calibrate {'full' if full else 'empty'}"})
+
+        elif method == "POST" and path == "/commands/raw":
+            data = json.loads(body) if body else {}
+            hex_str = data.get("hex", "").replace(" ", "")
+            if not hex_str:
+                send_json(writer, 400, {"error": "missing hex"})
+            else:
+                cmd_queue.put_nowait((bytes.fromhex(hex_str), f"raw {hex_str}"))
+                send_json(writer, 200, {"ok": True, "queued": f"raw {hex_str}"})
+
+        else:
+            send_json(writer, 404, {"error": "not found"})
+
+    except Exception as e:
+        log.error(f"[HTTP] Request error: {e}")
+        try:
+            send_json(writer, 500, {"error": str(e)})
+        except Exception:
+            pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+def send_json(writer: asyncio.StreamWriter, status: int, data: dict):
+    body = json.dumps(data).encode()
+    status_text = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}.get(status, "OK")
+    writer.write(
+        f"HTTP/1.1 {status} {status_text}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Access-Control-Allow-Origin: *\r\n"
+        f"\r\n".encode() + body
+    )
+
+
+async def start_cmd_server():
+    server = await asyncio.start_server(handle_cmd_request, "0.0.0.0", CMD_PORT)
+    log.info(f"[HTTP] Command server listening on :{CMD_PORT}")
+    return server
 
 
 # --- BlueZ cleanup (what Android does with gatt.close() + refreshDeviceCache) ---
@@ -369,8 +531,14 @@ async def sync_cycle(client, queue: asyncio.Queue, db) -> bool:
 # --- BLE main loop ---
 
 async def ble_loop():
+    global cmd_queue
+    cmd_queue = asyncio.Queue()
+
     db = init_db()
     log.info(f"[DB] Initialized at {DB_PATH}")
+
+    # Start command HTTP server
+    await start_cmd_server()
 
     packet_queue: asyncio.Queue[bytes] = asyncio.Queue()
     scan_failures = 0
@@ -429,6 +597,15 @@ async def ble_loop():
 
                 empty_cycles = 0
                 while client.is_connected and not disconnected_event.is_set():
+                    # Process any queued commands from the HTTP server
+                    while not cmd_queue.empty():
+                        try:
+                            cmd, label = cmd_queue.get_nowait()
+                            await ble_write(client, cmd, f"cmd: {label}")
+                            await asyncio.sleep(0.5)
+                        except Exception as e:
+                            log.error(f"[BLE] Command error: {e}")
+
                     try:
                         success = await sync_cycle(client, packet_queue, db)
                         if success:
@@ -446,7 +623,20 @@ async def ble_loop():
                         break
 
                     backoff = BACKOFF_BASE
-                    await asyncio.sleep(POLL_INTERVAL)
+
+                    # While waiting for next poll, check for commands every second
+                    for _ in range(POLL_INTERVAL):
+                        if disconnected_event.is_set():
+                            break
+                        if not cmd_queue.empty():
+                            while not cmd_queue.empty():
+                                try:
+                                    cmd, label = cmd_queue.get_nowait()
+                                    await ble_write(client, cmd, f"cmd: {label}")
+                                    await asyncio.sleep(0.5)
+                                except Exception as e:
+                                    log.error(f"[BLE] Command error: {e}")
+                        await asyncio.sleep(1)
 
         except Exception as e:
             log.error(f"[BLE] Connection error: {e}")
@@ -469,6 +659,7 @@ def main():
     log.info(f"[INIT] Goal: {GOAL_ML}ml")
     log.info(f"[INIT] Poll interval: {POLL_INTERVAL}s")
     log.info(f"[INIT] API: {API_URL}")
+    log.info(f"[INIT] Command server: :{CMD_PORT}")
     asyncio.run(ble_loop())
 
 
